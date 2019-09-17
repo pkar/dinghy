@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 )
 
 var (
@@ -61,17 +62,21 @@ func New(addr string, nodes []string, onLeader, onFollower ApplyFunc, l Logger, 
 	if onFollower == nil {
 		onFollower = DefaultOnFollower
 	}
-	c := &http.Client{}
+	c := &http.Client{
+		Timeout: time.Duration(hMS) * time.Millisecond,
+	}
 
 	id, err := hashToInt(addr, len(nodes)*1000)
 	if err != nil {
 		return nil, err
 	}
 	id++
+	mu := &sync.Mutex{}
+	mu.Lock()
 	d := &Dinghy{
 		client:      c,
 		logger:      l,
-		mu:          &sync.Mutex{},
+		mu:          mu,
 		routePrefix: DefaultRoutePrefix,
 		stopChan:    make(chan struct{}),
 		Addr:        addr,
@@ -80,6 +85,7 @@ func New(addr string, nodes []string, onLeader, onFollower ApplyFunc, l Logger, 
 		OnFollower:  onFollower,
 		State:       NewState(id, eMS, hMS),
 	}
+	mu.Unlock()
 	l.Printf("%+v", d)
 	return d, nil
 }
@@ -107,11 +113,15 @@ func (d *Dinghy) Start() error {
 		}
 		switch d.State.State() {
 		case StateFollower:
-			d.follower()
+			if err := d.follower(); err != nil {
+				return err
+			}
 		case StateCandidate:
 			d.candidate()
 		case StateLeader:
-			d.leader()
+			if err := d.leader(); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("unknown state %d", d.State.State())
 		}
@@ -120,23 +130,26 @@ func (d *Dinghy) Start() error {
 
 // follower will wait for an AppendEntries from the leader and on expiration will begin
 // the process of leader election with a RequestVote.
-func (d *Dinghy) follower() {
+func (d *Dinghy) follower() error {
 	d.logger.Println("entering follower state, leader id", d.State.LeaderID())
-	err := d.OnFollower()
-	if err != nil {
+	d.mu.Lock()
+	if err := d.OnFollower(); err != nil {
 		d.logger.Errorln("executing OnFollower", err)
+		d.mu.Unlock()
+		return err
 	}
+	d.mu.Unlock()
 LOOP:
 	for {
 		select {
 		case <-d.stopChan:
-			return
+			return nil
 		case newState := <-d.State.StateChanged():
 			if newState == StateFollower {
 				continue
 			}
 			d.logger.Println("follower state changed to", d.State.StateString(newState))
-			return
+			return nil
 		case <-d.State.HeartbeatReset():
 			d.logger.Println("heartbeat reset")
 			continue LOOP
@@ -155,7 +168,7 @@ LOOP:
 			d.State.LeaderID(UnknownLeaderID)
 			d.State.Term(d.State.Term() + 1)
 			d.State.State(StateCandidate)
-			return
+			return nil
 		}
 	}
 }
@@ -220,17 +233,33 @@ func (d *Dinghy) candidate() {
 
 // leader is for when in StateLeader. The loop will continually send
 // a heartbeat of AppendEntries to all peers at a rate of HeartbeatTimeoutMS.
-func (d *Dinghy) leader() {
+func (d *Dinghy) leader() error {
 	d.logger.Println("entering leader state")
-	err := d.OnLeader()
-	if err != nil {
-		d.logger.Errorln("executing OnLeader", err)
-	}
 	go d.AppendEntriesRequest()
+	errChan := make(chan error)
+	go func() {
+		// Run the OnLeader event in a goroutine in case
+		// it has a long delay. Any errors returned will exit the
+		// leader state.
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if err := d.OnLeader(); err != nil {
+			d.logger.Errorln("executing OnLeader", err)
+			errChan <- err
+		}
+	}()
 	for {
 		select {
+		case err := <-errChan:
+			d.State.State(StateFollower)
+			go func() {
+				// Removing the state change event here
+				// before returning error.
+				<-d.State.StateChanged()
+			}()
+			return err
 		case <-d.stopChan:
-			return
+			return nil
 		case <-d.State.AppendEntriesEvent():
 			// ignore any append entries to self.
 			continue
@@ -239,7 +268,7 @@ func (d *Dinghy) leader() {
 				continue
 			}
 			d.logger.Println("leader state changed to", d.State.StateString(newState))
-			return
+			return nil
 		case h := <-d.State.HeartbeatTick():
 			d.logger.Println("sending to peers AppendEntriesRequest", d.Nodes, h)
 			currentTerm, err := d.AppendEntriesRequest()
@@ -248,7 +277,7 @@ func (d *Dinghy) leader() {
 				switch err {
 				case ErrNewElectionTerm:
 					d.State.StepDown(currentTerm)
-					return
+					return nil
 				}
 			}
 		}
