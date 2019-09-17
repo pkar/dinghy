@@ -1,4 +1,4 @@
-# dinghy [![GoDoc](https://godoc.org/github.com/upsight/dinghy?status.svg)](http://godoc.org/github.com/upsight/dinghy) [![Build Status](https://travis-ci.org/upsight/dinghy.svg?branch=master)](https://travis-ci.org/upsight/dinghy)
+# dinghy [![GoDoc](https://godoc.org/github.com/upsight/dinghy?status.svg)](http://godoc.org/github.com/upsight/dinghy) ![](https://github.com/pkar/dinghy/workflows/Go/badge.svg)
 
 Dinghy implements leader election using part of the raft protocol. It might
 be useful if you have several workers but only want one of them at a time
